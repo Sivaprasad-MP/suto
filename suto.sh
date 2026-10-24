@@ -10,7 +10,8 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
+export PATH="${GOPATH:-$HOME/go}/bin:${HOME}/.local/bin:${PATH}"
 
 # Colors
 RED='\033[0;31m'
@@ -31,26 +32,27 @@ show_help() {
 ╚══════════════════════════════════════════════════════════════╝
 
 USAGE:
-  sudo ./suto.sh [OPTIONS] <domain>
+  ./suto.sh [OPTIONS] <domain>
 
 OPTIONS:
   --install         Install all required dependencies
   --full            Enable extended features (permutations, JS scraping, screenshots)
   --output DIR      Custom output directory (default: ./outputs/<domain>_<timestamp>)
+  --ports LIST      HTTP(S) ports to probe (default: 80,443; e.g. 80,443,8080,8443)
   --threads N       Thread count for parallel operations (default: 50)
   --update          Update all installed Go tools to latest versions
   -h, --help        Show this help message
 
 EXAMPLES:
   sudo ./suto.sh --install                           # Install everything
-  sudo ./suto.sh target.com                          # Quick run (enum + CNAME)
-  sudo ./suto.sh target.com --full                   # Full recon
-  sudo ./suto.sh target.com --output ~/reports       # Custom output dir
-  sudo ./suto.sh target.com --threads 100            # Faster with more threads
-  sudo ./suto.sh target.com --update                 # Update tools
+  ./suto.sh target.com                          # Quick run (enum + CNAME)
+  ./suto.sh target.com --full                   # Full recon
+  ./suto.sh target.com --output ~/reports       # Custom output dir
+  ./suto.sh target.com --threads 100            # Faster with more threads
+  ./suto.sh target.com --update                 # Update tools
 
 REQUIREMENTS:
-  - Must be run with sudo (for tool installation and DNS operations)
+  - Sudo is required only for --install
   - Internet connection required
   - Go must be installable (added by --install if missing)
 
@@ -80,7 +82,7 @@ install_tools() {
 
     # Update package lists
     echo -e "${YELLOW}[+] Updating package lists...${NC}"
-    apt update -y 2>/dev/null || true
+    apt update
 
     # System packages
     echo -e "${YELLOW}[+] Installing system packages...${NC}"
@@ -92,15 +94,17 @@ install_tools() {
         git \
         golang-go \
         python3 \
-        python3-pip \
-        xdg-utils \
-        2>/dev/null || true
+        pipx \
+        xdg-utils
 
     # Ensure Go PATH is correct
-    export GOPATH=$HOME/go
+    export GOPATH="${GOPATH:-$HOME/go}"
     export PATH=$PATH:$GOPATH/bin
     mkdir -p "$GOPATH/bin"
 
+    export GOBIN=/usr/local/bin
+    mkdir -p "$GOBIN"
+    local failures=0
     # Install Go tools
     echo -e "\n${YELLOW}[+] Installing Go-based tools...${NC}"
 
@@ -115,23 +119,23 @@ install_tools() {
 
     for tool in "${TOOLS[@]}"; do
         name=$(basename "$tool" | sed 's/@latest//' | sed 's/v2//' | sed 's/v3//' | sed 's/cmd\///')
-        if command -v "$name" &>/dev/null; then
+        if command -v "$name" &>/dev/null && { [[ "$name" != httpx ]] || httpx -h 2>&1 | grep -q -- "-no-fallback"; }; then
             echo -e "${GREEN}[✓] $name already installed${NC}"
         else
             echo -e "${CYAN}[~] Installing $name...${NC}"
-            go install "$tool" 2>/dev/null && echo -e "${GREEN}[✓] $name installed${NC}" || echo -e "${RED}[✗] Failed to install $name${NC}"
+            go install "$tool" && echo -e "${GREEN}[✓] $name installed${NC}" || { echo -e "${RED}[✗] Failed to install $name${NC}"; failures=$((failures + 1)); }
         fi
     done
 
     # Install nuclei templates
     echo -e "\n${YELLOW}[+] Installing/updating nuclei templates...${NC}"
-    nuclei -update-templates 2>/dev/null || true
+    nuclei -update-templates || { echo "Nuclei template update failed" >&2; failures=$((failures + 1)); }
 
     # Install extended tools if --install is called with --full
     if [[ "${INSTALL_FULL:-false}" == true ]]; then
         echo -e "\n${YELLOW}[+] Installing extended tools...${NC}"
         EXTRA_TOOLS=(
-            "github.com/owasp-amass/amass/v4/...@master"
+            "github.com/owasp-amass/amass/v4/...@latest"
             "github.com/projectdiscovery/shuffledns/cmd/shuffledns@latest"
             "github.com/projectdiscovery/chaos-client/cmd/chaos@latest"
             "github.com/tomnomnom/waybackurls@latest"
@@ -141,19 +145,21 @@ install_tools() {
         )
         for tool in "${EXTRA_TOOLS[@]}"; do
             name=$(basename "$tool" | sed 's/@latest//' | sed 's/v4//' | sed 's/cmd\///')
+            [[ "$tool" == *amass* ]] && name=amass
             command -v "$name" &>/dev/null && echo -e "${GREEN}[✓] $name already installed${NC}" || {
                 echo -e "${CYAN}[~] Installing $name...${NC}"
-                go install "$tool" 2>/dev/null && echo -e "${GREEN}[✓] $name installed${NC}" || echo -e "${RED}[✗] Failed to install $name${NC}"
+                go install "$tool" && echo -e "${GREEN}[✓] $name installed${NC}" || { echo -e "${RED}[✗] Failed to install $name${NC}"; failures=$((failures + 1)); }
             }
         done
 
         # Install dnsgen (Python)
         if ! command -v dnsgen &>/dev/null; then
             echo -e "${CYAN}[~] Installing dnsgen...${NC}"
-            pip3 install dnsgen 2>/dev/null && echo -e "${GREEN}[✓] dnsgen installed${NC}" || echo -e "${RED}[✗] Failed to install dnsgen${NC}"
+            PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install dnsgen && echo -e "${GREEN}[✓] dnsgen installed${NC}" || { echo -e "${RED}[✗] Failed to install dnsgen${NC}"; failures=$((failures + 1)); }
         fi
     fi
 
+    (( failures == 0 )) || { echo "Installation incomplete: $failures tool(s) failed." >&2; exit 1; }
     echo -e "\n${GREEN}[✓] Installation complete!${NC}"
     echo -e "${YELLOW}[*] Run: sudo $0 <domain>${NC}"
     exit 0
@@ -181,7 +187,7 @@ show_banner() {
 #  DNS UTILITY
 # ============================================================
 get_cname() {
-    dig +short CNAME "$1" 2>/dev/null | head -1
+    dig +time=3 +tries=1 +short CNAME "$1" | head -1
 }
 
 is_alive() {
@@ -231,14 +237,39 @@ TAKEOVER_PATTERNS=(
 )
 
 classify_cname() {
-    local cname="$1"
+    local cname="${1,,}" pattern
+    cname="${cname%.}"
     for pattern in "${!TAKEOVER_PATTERNS[@]}"; do
-        if echo "$cname" | grep -qiE "$pattern"; then
+        [[ "$pattern" == "s3-" ]] && continue
+        if [[ "$cname" == "$pattern" || "$cname" == *."$pattern" ]]; then
             echo "${TAKEOVER_PATTERNS[$pattern]}"
             return
         fi
     done
+    if [[ "$cname" == *.amazonaws.com && ( "$cname" == s3-* || "$cname" == *.s3-* || "$cname" == *.s3.* ) ]]; then
+        echo "AWS S3 Bucket"
+        return
+    fi
     echo "Unknown/Other"
+}
+
+html_escape() {
+    local value="$1"
+    value="${value//&/\&amp;}"
+    value="${value//</\&lt;}"
+    value="${value//>/\&gt;}"
+    value="${value//\"/\&quot;}"
+    value="${value//\'/\&#39;}"
+    printf '%s' "$value"
+}
+
+filter_scope() {
+    awk -v domain="$1" '{
+        host=tolower($0); sub(/\r$/, "", host)
+        if (host ~ /^[a-z0-9_][a-z0-9._-]*$/ && length(host) <= 253 &&
+            (host == domain || (length(host) > length(domain) &&
+             substr(host, length(host)-length(domain)) == "." domain))) print host
+    }' | sort -u
 }
 
 # ============================================================
@@ -309,7 +340,7 @@ HTMLHEADER
         <div class="card"><div class="number">$total</div><div class="label">Total Subdomains</div></div>
         <div class="card"><div class="number">$alive</div><div class="label">Alive</div></div>
         <div class="card"><div class="number">$candidates</div><div class="label">Takeover Candidates</div></div>
-        <div class="card"><div class="number" style="color: #ef4444;">$confirmed</div><div class="label">Confirmed Takeovers</div></div>
+        <div class="card"><div class="number" style="color: #ef4444;">$confirmed</div><div class="label">Scanner Findings (unverified)</div></div>
     </div>
 HTMLCARDS
 
@@ -320,7 +351,9 @@ HTMLCARDS
     <table>
         <tr><th>Subdomain</th><th>CNAME Target</th><th>Service</th><th>Status</th></tr>
 HTMLTABLE
-        while IFS=' -> ' read -r sub cname; do
+        while IFS= read -r record; do
+            sub="${record%% -> *}"
+            cname="${record#* -> }"
             cname_clean="${cname#-> }"
             service=$(classify_cname "$cname_clean")
             # Badge class
@@ -332,20 +365,20 @@ HTMLTABLE
             echo "$service_lower" | grep -qi "vercel" && badge_class="badge-vercel"
             echo "$service_lower" | grep -qi "github" && badge_class="badge-github"
             echo "$service_lower" | grep -qi "azure" && badge_class="badge-azure"
-            echo "<tr><td>$sub</td><td>$cname_clean</td><td><span class=\"badge $badge_class\">$service</span></td><td class=\"status-potential\">Potential</td></tr>" >> "$html_file"
+            echo "<tr><td>$(html_escape "$sub")</td><td>$(html_escape "$cname_clean")</td><td><span class=\"badge $badge_class\">$service</span></td><td class=\"status-potential\">Potential</td></tr>" >> "$html_file"
         done < "$outdir/takeover_candidates.txt"
         echo "</table>" >> "$html_file"
     fi
 
-    # Confirmed Takeovers
+    # Scanner Findings (unverified)
     if [[ -f "$outdir/confirmed_takeovers.txt" && -s "$outdir/confirmed_takeovers.txt" ]]; then
         cat >> "$html_file" << HTMLCONF
-    <h2>🚨 Confirmed Takeovers</h2>
+    <h2>🚨 Scanner Findings (unverified)</h2>
     <table>
         <tr><th>Subdomain</th><th>Service</th><th>Details</th></tr>
 HTMLCONF
         while IFS= read -r line; do
-            echo "<tr><td class=\"status-confirmed\">$line</td><td>—</td><td>Verify and exploit</td></tr>" >> "$html_file"
+            echo "<tr><td class=\"status-confirmed\">$(html_escape "$line")</td><td>—</td><td>Manual validation required</td></tr>" >> "$html_file"
         done < "$outdir/confirmed_takeovers.txt"
         echo "</table>" >> "$html_file"
     fi
@@ -357,10 +390,12 @@ HTMLCONF
     <table>
         <tr><th>Subdomain</th><th>CNAME Target</th><th>Service</th></tr>
 HTMLCNAME
-        while IFS=' -> ' read -r sub cname; do
+        while IFS= read -r record; do
+            sub="${record%% -> *}"
+            cname="${record#* -> }"
             cname_clean="${cname#-> }"
             service=$(classify_cname "$cname_clean")
-            echo "<tr><td>$sub</td><td>$cname_clean</td><td>$service</td></tr>" >> "$html_file"
+            echo "<tr><td>$(html_escape "$sub")</td><td>$(html_escape "$cname_clean")</td><td>$service</td></tr>" >> "$html_file"
         done < "$outdir/cname_records.txt"
         echo "</table>" >> "$html_file"
     fi
@@ -376,7 +411,7 @@ HTMLCNAME
 HTMLALL
         i=1
         while IFS= read -r sub; do
-            echo "<tr><td>$i</td><td>$sub</td></tr>" >> "$html_file"
+            echo "<tr><td>$i</td><td>$(html_escape "$sub")</td></tr>" >> "$html_file"
             ((i++))
         done < "$outdir/all_subdomains.txt"
         echo "</table></details>" >> "$html_file"
@@ -391,7 +426,7 @@ HTMLALL
 HTMLALIVE
         i=1
         while IFS= read -r sub; do
-            echo "<tr><td>$i</td><td class=\"status-alive\">$sub</td></tr>" >> "$html_file"
+            echo "<tr><td>$i</td><td class=\"status-alive\">$(html_escape "$sub")</td></tr>" >> "$html_file"
             ((i++))
         done < "$outdir/alive_subdomains.txt"
         echo "</table>" >> "$html_file"
@@ -417,12 +452,18 @@ run_enumeration() {
     local full_mode="${2:-false}"
     local timestamp
     timestamp=$(date +%Y%m%d_%H%M%S)
-    local outdir="${OUTPUT_DIR:-./outputs/${domain}_${timestamp}}"
+    local outdir="${OUTPUT_DIR:-./outputs/${domain}_${timestamp}_$$}"
+    local mode=Standard
+    [[ "$full_mode" == true ]] && mode=Extended
+    if [[ -d "$outdir" && -n "$(ls -A "$outdir")" ]]; then
+        echo "Output directory must be empty: $outdir" >&2
+        return 1
+    fi
     local threads="${THREADS:-50}"
 
     mkdir -p "$outdir/raw"
 
-    show_banner "$domain" "${full_mode:+Extended}"
+    show_banner "$domain" "$mode"
 
     # --------------------------------------------------------
     # PHASE 1: Subdomain Enumeration
@@ -431,18 +472,18 @@ run_enumeration() {
 
     # 1a. Assetfinder
     echo -e "${YELLOW}  [→] assetfinder...${NC}"
-    assetfinder --subs-only "$domain" 2>/dev/null | sort -u > "$outdir/raw/assetfinder.txt" || true
+    assetfinder --subs-only "$domain" 2>> "$outdir/errors.log" | sort -u > "$outdir/raw/assetfinder.txt" || true
     echo -e "${GREEN}      Found: $(wc -l < "$outdir/raw/assetfinder.txt")${NC}"
 
     # 1b. Subfinder
     echo -e "${YELLOW}  [→] subfinder...${NC}"
-    subfinder -d "$domain" -silent 2>/dev/null | sort -u > "$outdir/raw/subfinder.txt" || true
+    subfinder -d "$domain" -silent 2>> "$outdir/errors.log" | sort -u > "$outdir/raw/subfinder.txt" || true
     echo -e "${GREEN}      Found: $(wc -l < "$outdir/raw/subfinder.txt")${NC}"
 
     # 1c. crt.sh
     echo -e "${YELLOW}  [→] crt.sh...${NC}"
-    curl -s "https://crt.sh/?q=%25.${domain}&output=json" 2>/dev/null | \
-        jq -r '.[].name_value' 2>/dev/null | \
+    curl --connect-timeout 10 --max-time 60 -fsS "https://crt.sh/?q=%25.${domain}&output=json" 2>> "$outdir/errors.log" | \
+        jq -r '.[].name_value' 2>> "$outdir/errors.log" | \
         sed 's/\*\.//g' | \
         sort -u > "$outdir/raw/crtsh.txt" || true
     echo -e "${GREEN}      Found: $(wc -l < "$outdir/raw/crtsh.txt")${NC}"
@@ -450,14 +491,15 @@ run_enumeration() {
     # 1d. Amass (passive) — only in full mode
     if [[ "$full_mode" == true ]]; then
         echo -e "${YELLOW}  [→] amass (passive)...${NC}"
-        amass enum -passive -d "$domain" -o "$outdir/raw/amass.txt" 2>/dev/null || true
+        : > "$outdir/raw/amass.txt"
+        amass enum -passive -d "$domain" -o "$outdir/raw/amass.txt" 2>> "$outdir/errors.log" || true
         echo -e "${GREEN}      Found: $(wc -l < "$outdir/raw/amass.txt")${NC}"
     fi
 
     # 1e. Chaos (if available)
     if command -v chaos &>/dev/null; then
         echo -e "${YELLOW}  [→] chaos...${NC}"
-        chaos -d "$domain" -silent 2>/dev/null | sort -u > "$outdir/raw/chaos.txt" || true
+        chaos -d "$domain" -silent 2>> "$outdir/errors.log" | sort -u > "$outdir/raw/chaos.txt" || true
         echo -e "${GREEN}      Found: $(wc -l < "$outdir/raw/chaos.txt")${NC}"
     fi
 
@@ -465,21 +507,18 @@ run_enumeration() {
     # PHASE 2: Merge & Deduplicate
     # --------------------------------------------------------
     echo -e "\n${BLUE}[*] Phase 2: Merging & Deduplicating${NC}"
-    cat "$outdir/raw/"*.txt 2>/dev/null | \
-        grep -E "^[a-zA-Z0-9._-]+\.${domain}$" | \
-        sed 's/^\.//' | \
-        sort -u > "$outdir/all_subdomains.txt"
+    cat "$outdir/raw/"*.txt | filter_scope "$domain" > "$outdir/all_subdomains.txt"
     total=$(wc -l < "$outdir/all_subdomains.txt")
     echo -e "${GREEN}      Total unique subdomains: $total${NC}"
 
     # Permutation generation (full mode only)
     if [[ "$full_mode" == true ]] && command -v dnsgen &>/dev/null; then
         echo -e "${YELLOW}  [→] Generating permutations...${NC}"
-        dnsgen "$outdir/all_subdomains.txt" 2>/dev/null | \
-            grep -E "\.${domain}$" | \
+        dnsgen "$outdir/all_subdomains.txt" 2>> "$outdir/errors.log" | \
+            filter_scope "$domain" | \
             sort -u > "$outdir/permutations.txt" || true
         # Merge permutations back
-        cat "$outdir/permutations.txt" >> "$outdir/all_subdomains.txt" 2>/dev/null || true
+        cat "$outdir/permutations.txt" >> "$outdir/all_subdomains.txt" 2>> "$outdir/errors.log" || true
         sort -u -o "$outdir/all_subdomains.txt" "$outdir/all_subdomains.txt"
         total=$(wc -l < "$outdir/all_subdomains.txt")
         echo -e "${GREEN}      After permutations: $total unique subdomains${NC}"
@@ -490,22 +529,25 @@ run_enumeration() {
     # --------------------------------------------------------
     echo -e "\n${BLUE}[*] Phase 3: Checking alive subdomains${NC}"
     echo -e "${YELLOW}  [→] httpx probe...${NC}"
-    httpx -l "$outdir/all_subdomains.txt" \
-        -silent \
-        -status-code \
-        -follow-redirects \
-        -timeout 5 \
-        -o "$outdir/alive_raw.txt" 2>/dev/null || true
-
-    # Extract just the URLs (first column)
-    awk '{print $1}' "$outdir/alive_raw.txt" 2>/dev/null | sed 's/^https\?:\/\///' | sort -u > "$outdir/alive_subdomains.txt"
+    : > "$outdir/alive_raw.txt"
+    if ! httpx -l "$outdir/all_subdomains.txt" \
+        -silent -no-color -status-code -no-fallback \
+        -ports "${PORTS:-80,443}" -threads "$threads" \
+        -timeout 5 -o "$outdir/alive_raw.txt" 2>> "$outdir/errors.log"; then
+        echo "HTTP probe failed; see $outdir/errors.log" >&2
+        return 1
+    fi
+    # Preserve URLs and ports for downstream HTTP tools; count unique hostnames separately.
+    awk '{print $1}' "$outdir/alive_raw.txt" | sort -u > "$outdir/alive_urls.txt"
+    sed -E 's@^https?://@@; s@[:/].*$@@' "$outdir/alive_urls.txt" |
+        filter_scope "$domain" > "$outdir/alive_subdomains.txt"
     alive=$(wc -l < "$outdir/alive_subdomains.txt")
     echo -e "${GREEN}      Alive: $alive${NC}"
 
-    # Dead = total - alive
-    comm -23 <(sort "$outdir/all_subdomains.txt") <(sort "$outdir/alive_subdomains.txt") 2>/dev/null > "$outdir/dead_subdomains.txt" || true
+    # No HTTP response does not imply the DNS hostname is absent.
+    comm -23 <(sort "$outdir/all_subdomains.txt") <(sort "$outdir/alive_subdomains.txt") 2>> "$outdir/errors.log" > "$outdir/dead_subdomains.txt" || true
     dead=$(wc -l < "$outdir/dead_subdomains.txt")
-    echo -e "${YELLOW}      Dead (still check CNAMEs): $dead${NC}"
+    echo -e "${YELLOW}      No HTTP response on selected ports (still check DNS): $dead${NC}"
 
     # --------------------------------------------------------
     # PHASE 4: CNAME Extraction (CRITICAL)
@@ -517,11 +559,10 @@ run_enumeration() {
     > "$outdir/cname_records.txt"
     export -f get_cname
 
-    # Use parallel for speed
-    cat "$outdir/all_subdomains.txt" | \
-        parallel -j "$threads" --progress \
-        'cname=$(dig +short CNAME {} 2>/dev/null); [ -n "$cname" ] && echo "{} -> $cname"' \
-        2>/dev/null > "$outdir/cname_records.txt" || true
+    # Keep every CNAME answer on its own row, including names containing hyphens.
+    parallel -j "$threads" \
+        'dig +time=3 +tries=1 +short CNAME {} | while IFS= read -r cname; do if [ -n "$cname" ]; then printf "%s -> %s\n" {} "$cname"; fi; done' \
+        < "$outdir/all_subdomains.txt" > "$outdir/cname_records.txt" 2>> "$outdir/errors.log"
 
     cname_count=$(wc -l < "$outdir/cname_records.txt")
     echo -e "${GREEN}      Subdomains with CNAMEs: $cname_count${NC}"
@@ -531,16 +572,13 @@ run_enumeration() {
     # --------------------------------------------------------
     echo -e "\n${BLUE}[*] Phase 5: Filtering Takeover Candidates${NC}"
 
-    # Build grep pattern dynamically from known services
-    patterns=()
-    for pattern in "${!TAKEOVER_PATTERNS[@]}"; do
-        patterns+=("$pattern")
-    done
-    # Join with | for grep
-    pattern_regex=$(IFS='|'; echo "${patterns[*]}")
-
-    grep -iE "$pattern_regex" "$outdir/cname_records.txt" \
-        > "$outdir/takeover_candidates.txt" 2>/dev/null || true
+    : > "$outdir/takeover_candidates.txt"
+    while IFS= read -r record; do
+        cname="${record#* -> }"
+        if [[ "$(classify_cname "$cname")" != "Unknown/Other" ]]; then
+            printf '%s\n' "$record" >> "$outdir/takeover_candidates.txt"
+        fi
+    done < "$outdir/cname_records.txt"
 
     candidates=$(wc -l < "$outdir/takeover_candidates.txt")
     echo -e "${YELLOW}      Takeover candidates: $candidates${NC}"
@@ -548,7 +586,9 @@ run_enumeration() {
     if [[ $candidates -gt 0 ]]; then
         echo ""
         echo -e "${YELLOW}      ┌─────────────────────────────────────────────────────┐${NC}"
-        while IFS=' -> ' read -r sub cname; do
+        while IFS= read -r record; do
+            sub="${record%% -> *}"
+            cname="${record#* -> }"
             cname_clean="${cname#-> }"
             service=$(classify_cname "$cname_clean")
             echo -e "${YELLOW}      │${NC} $sub"
@@ -569,33 +609,35 @@ run_enumeration() {
     # 6a. Nuclei takeover templates
     if command -v nuclei &>/dev/null && [[ -d ~/nuclei-templates/http/takeovers/ ]]; then
         echo -e "${YELLOW}  [→] nuclei takeover templates...${NC}"
-        nuclei -l "$outdir/alive_subdomains.txt" \
+        : > "$outdir/nuclei_results.txt"
+        nuclei -l "$outdir/alive_urls.txt" \
             -t ~/nuclei-templates/http/takeovers/ \
             -silent \
-            -o "$outdir/nuclei_results.txt" 2>/dev/null || true
+            -o "$outdir/nuclei_results.txt" 2>> "$outdir/errors.log" || true
         nucount=$(wc -l < "$outdir/nuclei_results.txt")
         echo -e "${GREEN}      Nuclei findings: $nucount${NC}"
-        cat "$outdir/nuclei_results.txt" >> "$outdir/confirmed_takeovers.txt" 2>/dev/null || true
+        cat "$outdir/nuclei_results.txt" >> "$outdir/confirmed_takeovers.txt" 2>> "$outdir/errors.log" || true
     fi
 
     # 6b. Subjack
     if command -v subjack &>/dev/null; then
         echo -e "${YELLOW}  [→] subjack scan...${NC}"
-        subjack -w "$outdir/alive_subdomains.txt" \
+        : > "$outdir/subjack_results.txt"
+        subjack -w "$outdir/all_subdomains.txt" \
             -t "$threads" \
             -timeout 30 \
             -ssl \
-            -o "$outdir/subjack_results.txt" 2>/dev/null || true
-        sjcount=$(wc -l < "$outdir/subjack_results.txt" 2>/dev/null || echo 0)
+            -o "$outdir/subjack_results.txt" 2>> "$outdir/errors.log" || true
+        sjcount=$(wc -l < "$outdir/subjack_results.txt" 2>> "$outdir/errors.log" || echo 0)
         echo -e "${GREEN}      Subjack findings: $sjcount${NC}"
-        [[ -f "$outdir/subjack_results.txt" ]] && cat "$outdir/subjack_results.txt" >> "$outdir/confirmed_takeovers.txt" 2>/dev/null || true
+        [[ -f "$outdir/subjack_results.txt" ]] && cat "$outdir/subjack_results.txt" >> "$outdir/confirmed_takeovers.txt" 2>> "$outdir/errors.log" || true
     fi
 
     # Deduplicate confirmed
     if [[ -f "$outdir/confirmed_takeovers.txt" ]]; then
         sort -u -o "$outdir/confirmed_takeovers.txt" "$outdir/confirmed_takeovers.txt"
         confirmed=$(wc -l < "$outdir/confirmed_takeovers.txt")
-        echo -e "${RED}      Total confirmed: $confirmed${NC}"
+        echo -e "${RED}      Total scanner findings: $confirmed${NC}"
     fi
 
     # --------------------------------------------------------
@@ -609,7 +651,7 @@ run_enumeration() {
             echo -e "${YELLOW}  [→] waybackurls on takeover candidates...${NC}"
             if [[ -s "$outdir/takeover_candidates.txt" ]]; then
                 awk '{print $1}' "$outdir/takeover_candidates.txt" | \
-                    waybackurls 2>/dev/null > "$outdir/wayback_urls.txt" || true
+                    waybackurls 2>> "$outdir/errors.log" > "$outdir/wayback_urls.txt" || true
                 wbcount=$(wc -l < "$outdir/wayback_urls.txt")
                 echo -e "${GREEN}      Wayback URLs found: $wbcount${NC}"
             fi
@@ -618,8 +660,8 @@ run_enumeration() {
         # 7b. JS scraping for leaked origins
         if command -v hakrawler &>/dev/null && [[ -s "$outdir/takeover_candidates.txt" ]]; then
             echo -e "${YELLOW}  [→] hakrawler JS scraping...${NC}"
-            awk '{print $1}' "$outdir/takeover_candidates.txt" | \
-                hakrawler -js -depth 2 -silent 2>/dev/null | \
+            cat "$outdir/alive_urls.txt" | \
+                hakrawler -d 2 -dr -timeout 10 -t "$threads" 2>> "$outdir/errors.log" | \
                 grep -iE 's3|bucket|amazonaws|origin|cloudfront' \
                 > "$outdir/js_leaks.txt" || true
             jsleaks=$(wc -l < "$outdir/js_leaks.txt")
@@ -630,12 +672,11 @@ run_enumeration() {
         if command -v gowitness &>/dev/null && [[ -s "$outdir/alive_subdomains.txt" ]]; then
             echo -e "${YELLOW}  [→] gowitness screenshots...${NC}"
             mkdir -p "$outdir/screenshots"
-            gowitness file -f "$outdir/alive_subdomains.txt" \
-                --destination "$outdir/screenshots" \
+            gowitness scan file -f "$outdir/alive_urls.txt" \
+                --screenshot-path "$outdir/screenshots" \
                 --threads "$threads" \
-                --no-http \
-                --timeout 10 2>/dev/null || true
-            scount=$(ls "$outdir/screenshots/"*.png 2>/dev/null | wc -l)
+                --timeout 10 2>> "$outdir/errors.log" || true
+            scount=$(find "$outdir/screenshots" -type f -name "*.png" | wc -l)
             echo -e "${GREEN}      Screenshots taken: $scount${NC}"
         fi
     fi
@@ -650,26 +691,30 @@ run_enumeration() {
         echo "  suto.sh — Scan Summary"
         echo "  Target: $domain"
         echo "  Date:   $(date)"
-        echo "  Mode:   ${full_mode:+Extended}${full_mode:-Standard}"
+        echo "  Mode:   $mode"
+        echo "  HTTP ports: ${PORTS:-80,443}"
         echo "============================================"
         echo ""
         echo "  Total subdomains found:    $total"
         echo "  Alive subdomains:          $alive"
-        echo "  Dead subdomains:           $dead"
+        echo "  No HTTP on selected ports: $dead"
+        echo "  See errors.log for diagnostics. DNS existence and takeover status require separate validation."
         echo "  Subdomains with CNAMEs:    $cname_count"
         echo "  Takeover candidates:       $candidates"
-        echo "  Confirmed takeovers:       ${confirmed:-0}"
+        echo "  Scanner findings (unverified):       ${confirmed:-0}"
         echo ""
         if [[ $candidates -gt 0 ]]; then
             echo "  ⚠ TAKEOVER CANDIDATES:"
-            while IFS=' -> ' read -r sub cname; do
+            while IFS= read -r record; do
+            sub="${record%% -> *}"
+            cname="${record#* -> }"
                 echo "    $sub"
                 echo "      → $cname"
             done < "$outdir/takeover_candidates.txt"
             echo ""
         fi
         if [[ ${confirmed:-0} -gt 0 ]]; then
-            echo "  🚨 CONFIRMED TAKEOVERS:"
+            echo "  🚨 SCANNER FINDINGS (UNVERIFIED):"
             cat "$outdir/confirmed_takeovers.txt"
             echo ""
         fi
@@ -696,9 +741,13 @@ run_enumeration() {
     echo -e "${BLUE}[*] Summary:${NC}  $outdir/summary.txt"
     echo ""
 
+    if [[ -s "$outdir/errors.log" ]]; then
+        echo "Some tools reported diagnostics; review $outdir/errors.log before interpreting missing findings." >&2
+    fi
+
     # Try to open HTML report
     if command -v xdg-open &>/dev/null; then
-        xdg-open "$outdir/report.html" 2>/dev/null || true
+        xdg-open "$outdir/report.html" 2>> "$outdir/errors.log" || true
     fi
 }
 
@@ -707,7 +756,8 @@ run_enumeration() {
 # ============================================================
 update_tools() {
     echo -e "${BLUE}[*] Updating all Go tools...${NC}"
-    export GOPATH=$HOME/go
+    local failures=0
+    export GOPATH="${GOPATH:-$HOME/go}"
     export PATH=$PATH:$GOPATH/bin
 
     TOOLS=(
@@ -722,13 +772,14 @@ update_tools() {
     for tool in "${TOOLS[@]}"; do
         name=$(basename "$tool" | sed 's/@latest//' | sed 's/v2//' | sed 's/v3//' | sed 's/cmd\///')
         echo -e "${CYAN}[~] Updating $name...${NC}"
-        go install "$tool" 2>/dev/null && echo -e "${GREEN}[✓] $name updated${NC}" || echo -e "${RED}[✗] Failed to update $name${NC}"
+        go install "$tool" && echo -e "${GREEN}[✓] $name updated${NC}" || { echo -e "${RED}[✗] Failed to update $name${NC}"; failures=$((failures + 1)); }
     done
 
     # Update nuclei templates
     echo -e "\n${YELLOW}[+] Updating nuclei templates...${NC}"
-    nuclei -update-templates 2>/dev/null || true
+    nuclei -update-templates || { echo "Nuclei template update failed" >&2; failures=$((failures + 1)); }
 
+    (( failures == 0 )) || { echo "Update incomplete: $failures tool(s) failed." >&2; exit 1; }
     echo -e "\n${GREEN}[✓] Update complete!${NC}"
     exit 0
 }
@@ -754,11 +805,18 @@ main() {
                 shift
                 ;;
             --output)
+                [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { echo "--output requires a directory" >&2; exit 1; }
                 OUTPUT_DIR="$2"
                 shift 2
                 ;;
             --threads)
+                [[ $# -ge 2 ]] || { echo "--threads requires a number" >&2; exit 1; }
                 THREADS="$2"
+                shift 2
+                ;;
+            --ports)
+                [[ $# -ge 2 ]] || { echo "--ports requires a list" >&2; exit 1; }
+                PORTS="$2"
                 shift 2
                 ;;
             --update)
@@ -774,6 +832,7 @@ main() {
                 exit 1
                 ;;
             *)
+                [[ -z "$domain" ]] || { echo "Specify exactly one domain" >&2; exit 1; }
                 domain="$1"
                 shift
                 ;;
@@ -783,11 +842,11 @@ main() {
     # Handle modes
     if [[ "$install_mode" == true ]]; then
         check_sudo
+        INSTALL_FULL="$full_mode"
         install_tools
     fi
 
     if [[ "$update_mode" == true ]]; then
-        check_sudo
         update_tools
     fi
 
@@ -800,12 +859,42 @@ main() {
     fi
 
     # Set defaults
-    OUTPUT_DIR="${OUTPUT_DIR:-./outputs}"
     THREADS="${THREADS:-50}"
 
+    domain="${domain,,}"
+    domain="${domain%.}"
+    if [[ ${#domain} -gt 253 || "$domain" != *.* || "$domain" == *..* ||
+          ! "$domain" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+        echo "Invalid domain: $domain (use a hostname without scheme, path, or port)." >&2
+        exit 1
+    fi
+    local label
+    IFS=. read -ra labels <<< "$domain"
+    for label in "${labels[@]}"; do
+        [[ ${#label} -le 63 && "$label" != -* && "$label" != *- ]] || { echo "Invalid domain label" >&2; exit 1; }
+    done
+    [[ "$THREADS" =~ ^[1-9][0-9]{0,3}$ ]] || { echo "Threads must be between 1 and 9999" >&2; exit 1; }
+    PORTS="${PORTS:-80,443}"
+    [[ "$PORTS" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "Ports must be a comma-separated list" >&2; exit 1; }
+    local port
+    IFS=, read -ra port_list <<< "$PORTS"
+    for port in "${port_list[@]}"; do
+        [[ ${#port} -le 5 ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || { echo "Invalid port: $port" >&2; exit 1; }
+    done
+    local tool
+    for tool in assetfinder subfinder httpx curl jq dig parallel; do
+        command -v "$tool" >/dev/null || { echo "Missing dependency: $tool (run --install)" >&2; exit 1; }
+    done
+    local httpx_help
+    httpx_help=$(httpx -h 2>&1) || { echo "Cannot inspect httpx" >&2; exit 1; }
+    [[ "$httpx_help" == *-no-fallback* && "$httpx_help" == *-ports* ]] || {
+        echo "ProjectDiscovery httpx is required; another program named httpx may be on PATH." >&2
+        exit 1
+    }
     # Run
-    check_sudo
     run_enumeration "$domain" "$full_mode"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
